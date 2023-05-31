@@ -18,13 +18,25 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+	"time"
 
+	apiv2 "github.com/operator-framework/api/pkg/operators/v2"
+	"github.com/operator-framework/operator-lib/conditions"
+	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/internal/controller/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	operatorv1alpha1 "github.com/mrcwisniewski/nginx-operator/api/v1alpha1"
+	"github.com/mrcwisniewski/nginx-operator/assets"
+	"github.com/mrcwisniewski/nginx-operator/controllers/metrics"
 )
 
 // NginxOperatorReconciler reconciles a NginxOperator object
@@ -36,6 +48,7 @@ type NginxOperatorReconciler struct {
 //+kubebuilder:rbac:groups=operator.mrcwisniewski,resources=nginxoperators,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=operator.mrcwisniewski,resources=nginxoperators/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=operator.mrcwisniewski,resources=nginxoperators/finalizers,verbs=update
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -47,16 +60,106 @@ type NginxOperatorReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.14.1/pkg/reconcile
 func (r *NginxOperatorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = log.FromContext(ctx)
+	metrics.ReconcilesTotal.Inc()
+	logger := log.FromContext(ctx)
+	operatorCR := &operatorv1alpha1.NginxOperator{}
+	err := r.Get(ctx, req.NamespacedName, operatorCR)
 
-	// TODO(user): your logic here
+	if err != nil && errors.IsNotFound(err) {
+		logger.Info("Operator resource object not found")
+		return ctrl.Result{}, nil
+	} else if err != nil {
+		logger.Error(err, "Error getting operator resource object")
+		meta.SetStatusCondition(&operatorCR.Status.Conditions,
+			metav1.Condition{
+				Type:               "OperatorDegraded",
+				Status:             metav1.ConditionTrue,
+				Reason:             "OperatorResourceNotAvailable",
+				LastTransitionTime: metav1.NewTime(time.Now()),
+				Message:            fmt.Sprintf("unable to get operator custom resource: %s", err.Error()),
+			})
+		return ctrl.Result{}, utilerrors.NewAggregate([]error{err, r.Status().Update(ctx, operatorCR)})
+	}
 
-	return ctrl.Result{}, nil
+	deployment := &appsv1.Deployment{}
+	create := false
+	err = r.Get(ctx, req.NamespacedName, deployment)
+
+	if err != nil && errors.IsNotFound(err) {
+		create = true
+		deployment = assets.
+			GetDeploymentFromFile("manifests/nginx_deployment.yaml")
+	} else if err != nil {
+		logger.Error(err, "Error getting existing Nginx deployment.")
+		meta.SetStatusCondition(&operatorCR.Status.Conditions,
+			metav1.Condition{
+				Type:               "OperatorDegraded",
+				Status:             metav1.ConditionTrue,
+				Reason:             "OperandDeploymentNotAvailable",
+				LastTransitionTime: metav1.NewTime(time.Now()),
+				Message:            fmt.Sprintf("unable to get operand deployment: %s", err.Error()),
+			})
+		return ctrl.Result{}, utilerrors.NewAggregate([]error{err, r.Status().Update(ctx, operatorCR)})
+	}
+
+	if operatorCR.Spec.Replicas != nil {
+		deployment.Spec.Replicas = operatorCR.Spec.Replicas
+	}
+
+	if operatorCR.Spec.Port != nil {
+		deployment.Spec.Template.Spec.Containers[0].Ports[0].
+			ContainerPort = *operatorCR.Spec.Port
+	}
+
+	ctrl.SetControllerReference(operatorCR, deployment, r.Scheme)
+
+	if create {
+		err = r.Create(ctx, deployment)
+	} else {
+		err = r.Update(ctx, deployment)
+	}
+
+	if err != nil {
+		meta.SetStatusCondition(&operatorCR.Status.Conditions,
+			metav1.Condition{
+				Type:               "OperatorDegraded",
+				Status:             metav1.ConditionTrue,
+				Reason:             "OperandDeploymentFailed",
+				LastTransitionTime: metav1.NewTime(time.Now()),
+				Message:            fmt.Sprintf("unable to update operand deployment: %s", err.Error()),
+			})
+		return ctrl.Result{}, utilerrors.NewAggregate([]error{err, r.Status().Update(ctx, operatorCR)})
+	}
+
+	meta.SetStatusCondition(&operatorCR.Status.Conditions,
+		metav1.Condition{
+			Type:               "OperatorDegraded",
+			Status:             metav1.ConditionFalse,
+			Reason:             "OperandDeploymentSucceeded",
+			LastTransitionTime: metav1.NewTime(time.Now()),
+			Message:            fmt.Sprintf("operarator successfulyy reconciling"),
+		})
+	r.Status().Update(ctx, operatorCR)
+
+	condition, err := conditions.InClusterFactory{Client: r.Client}.NewCondition(apiv2.ConditionType(apiv2.Upgradeable))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	err = condition.Set(ctx, metav1.ConditionTrue,
+		conditions.WithReason("OperatorUpgradeable"),
+		conditions.WithMessage("The operator is upgradeable"))
+
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, utilerrors.NewAggregate([]error{err, r.Status().Update(ctx, operatorCR)})
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NginxOperatorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&operatorv1alpha1.NginxOperator{}).
+		Owns(&appsv1.Deployment{}).
 		Complete(r)
 }
